@@ -10,7 +10,7 @@ from langchain_chroma import Chroma
 from langchain_core.runnables import RunnablePassthrough, RunnableParallel
 from langchain_core.output_parsers import StrOutputParser, PydanticOutputParser
 from langchain.memory import ConversationBufferWindowMemory
-from langchain_core.prompts import PromptTemplate, ChatPromptTemplate
+from langchain_core.prompts import PromptTemplate, ChatPromptTemplate, HumanMessagePromptTemplate
 from langchain_core.messages import SystemMessage, HumanMessage
 from pydantic import BaseModel, Field
 from typing import Optional, Dict, Any
@@ -123,8 +123,12 @@ class QueryProcessor:
 class MedicalPromptManager:
     def __init__(self):
         self.base_system_prompt = """
-        You are a knowledgeable medical information assistant. Your role is to provide accurate, 
-        evidence-based health information while maintaining appropriate medical disclaimers.
+        You are a medical assistant that ONLY answers based on the retrieved medical information.
+        You MUST prioritize the context provided below when forming your answer.
+        - If the context does not have enough information, clearly say: "The retrieved medical information does not fully answer this question."
+        - Never invent medical facts.
+        - Always remain professional and cautious.
+
         
         IMPORTANT GUIDELINES:
         1. Always recommend consulting healthcare professionals for medical concerns
@@ -166,7 +170,7 @@ class MedicalPromptManager:
         if query_analysis.intent in self.intent_prompts:
             system_content += "\n" + self.intent_prompts[query_analysis.intent]
         
-        if query_analysis.urgency_level in ['high', 'emergecy']:
+        if query_analysis.urgency_level in ['high', 'emergency']:
             system_content += "\nIMPORTANT: This query has high urgency. Respond accordingly."
         
         if conversation_history:
@@ -191,9 +195,24 @@ class MedicalPromptManager:
             Please provide a helpful, accurate response following the guidelines above.
             """
         
+        user_template = PromptTemplate(
+        template="""
+        Retrieved medical information:
+        {context}
+
+        Question: {question}
+
+        Previous conversation (if relevant):
+        {history}
+
+        Please provide a helpful, accurate response following the guidelines above.
+        """,
+        input_variables=["context", "question", "history"]
+        )
+
         return ChatPromptTemplate.from_messages([
             SystemMessage(content=system_content),
-            HumanMessage(content=user_template)
+            HumanMessagePromptTemplate(prompt=user_template)
         ])
 
 
