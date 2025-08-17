@@ -10,202 +10,370 @@ import requests
 from bs4 import BeautifulSoup
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 import httpx
-import re  # ADD THIS IMPORT - This was missing!
+import re
+import yaml
+import json
+from pathlib import Path
+from typing import Dict, List, Any
+from urllib.parse import urljoin, urlparse
+import os
 
 # Load environment variables from .env file
 dotenv.load_dotenv()
 persist_directory = "./chroma_langchain_db"
 
-# Source URLs
-source_urls = {
-    # Pages that contain multiple article links
-    "index_pages": [
-        "https://www.cdc.gov/media/releases/index.html",
-        "https://www.nih.gov/news-events/news-releases",
-        "https://www.who.int/news",
-    ],
+# -------- Configuration Loading -------- #
+
+def load_source_config(config_path: str = "sources.yaml") -> Dict[str, Any]:
+    """Load source configuration from YAML file"""
+    config_file = Path(config_path)
     
-    # Pages that are direct articles
-    "direct_articles": [
-        # Remove the example URL that returns 404
-        # "https://medlineplus.gov/news/fullstory_123456.html",
-    ]
-}
+    if not config_file.exists():
+        # Create default config if it doesn't exist
+        default_config = {
+            "sources": {
+                "medical_news": {
+                    "cdc": {
+                        "index_pages": ["https://www.cdc.gov/media/releases/index.html"],
+                        "link_patterns": [r"/media/releases/\d{4}/"],
+                        "domain": "cdc.gov"
+                    },
+                    "nih": {
+                        "index_pages": ["https://www.nih.gov/news-events/news-releases"],
+                        "link_patterns": [r"/news-events/news-releases/\d{4}/"],
+                        "domain": "nih.gov"
+                    },
+                    "who": {
+                        "index_pages": ["https://www.who.int/news"],
+                        "link_patterns": [r"/news/item/"],
+                        "domain": "who.int"
+                    }
+                }
+            },
+            "discovery": {
+                "auto_discover_similar_sites": True,
+                "max_depth": 2,
+                "respect_robots_txt": True,
+                "user_agent": "Medical-Agent-Indexer/1.0"
+            },
+            "filtering": {
+                "min_content_length": 500,
+                "exclude_patterns": [
+                    r"\.pdf$", r"\.doc$", r"\.xlsx?$",
+                    r"/search\?", r"/tag/", r"/category/"
+                ],
+                "required_keywords": ["health", "medical", "disease", "treatment", "research"]
+            }
+        }
+        
+        with open(config_file, 'w') as f:
+            yaml.dump(default_config, f, default_flow_style=False)
+        
+        print(f"Created default configuration at {config_path}")
+        return default_config
+    
+    with open(config_file, 'r') as f:
+        return yaml.safe_load(f)
 
 
-# -------- Prefect Tasks -------- #
+def load_source_config_from_env() -> Dict[str, Any]:
+    """Load configuration from environment variables"""
+    config = {
+        "sources": {},
+        "discovery": {
+            "auto_discover_similar_sites": os.getenv("AUTO_DISCOVER", "true").lower() == "true",
+            "max_depth": int(os.getenv("MAX_CRAWL_DEPTH", "2")),
+            "respect_robots_txt": True,
+            "user_agent": os.getenv("USER_AGENT", "Medical-Agent-Indexer/1.0")
+        }
+    }
+    
+    # Load URLs from environment variables
+    source_urls = os.getenv("SOURCE_URLS", "")
+    if source_urls:
+        urls = [url.strip() for url in source_urls.split(",") if url.strip()]
+        config["sources"]["custom"] = {
+            "index_pages": urls,
+            "link_patterns": [r".*"],  # Accept all patterns
+            "domain": "*"
+        }
+    
+    return config
 
-@task(name="discover_new_documents")
-def discover_new_documents(index_urls: list[str]) -> list[str]:
-    """Scrape index pages to collect article links, filtering only real news/article URLs."""
+
+# -------- Dynamic URL Discovery Tasks -------- #
+
+@task(name="discover_related_sites")
+def discover_related_sites(seed_urls: List[str], keywords: List[str]) -> List[str]:
+    """
+    Discover related medical/health sites by analyzing links from seed sites
+    """
+    related_sites = set()
+    
+    for seed_url in seed_urls:
+        try:
+            response = requests.get(seed_url, timeout=10)
+            soup = BeautifulSoup(response.text, 'html.parser')
+            
+            # Look for external links
+            for link in soup.find_all('a', href=True):
+                href = link.get('href')
+                if not href or not href.startswith('http'):
+                    continue
+                
+                domain = urlparse(href).netloc
+                
+                # Check if link text or surrounding context contains health keywords
+                link_text = link.get_text().lower()
+                if any(keyword in link_text for keyword in keywords):
+                    # Check if it's a news/press release section
+                    if any(pattern in href.lower() for pattern in ['news', 'press', 'release', 'media']):
+                        related_sites.add(href)
+                        
+        except Exception as e:
+            print(f"Error discovering related sites from {seed_url}: {e}")
+    
+    return list(related_sites)
+
+
+@task(name="discover_sitemap_urls")
+def discover_sitemap_urls(base_domains: List[str]) -> List[str]:
+    """
+    Discover URLs from sitemaps
+    """
+    sitemap_urls = []
+    
+    for domain in base_domains:
+        if not domain.startswith('http'):
+            domain = f"https://{domain}"
+        
+        # Common sitemap locations
+        sitemap_paths = ['/sitemap.xml', '/sitemap_index.xml', '/robots.txt']
+        
+        for path in sitemap_paths:
+            try:
+                sitemap_url = urljoin(domain, path)
+                response = requests.get(sitemap_url, timeout=10)
+                
+                if response.status_code == 200:
+                    if path == '/robots.txt':
+                        # Parse robots.txt for sitemap references
+                        for line in response.text.split('\n'):
+                            if line.lower().startswith('sitemap:'):
+                                sitemap_urls.append(line.split(':', 1)[1].strip())
+                    else:
+                        # Parse XML sitemap
+                        soup = BeautifulSoup(response.text, 'xml')
+                        for loc in soup.find_all('loc'):
+                            url = loc.get_text()
+                            # Filter for news/press release URLs
+                            if any(keyword in url.lower() for keyword in ['news', 'press', 'release', 'media']):
+                                sitemap_urls.append(url)
+                                
+            except Exception as e:
+                print(f"Error processing sitemap for {domain}: {e}")
+    
+    return sitemap_urls
+
+
+@task(name="discover_rss_feeds")
+def discover_rss_feeds(domains: List[str]) -> List[str]:
+    """
+    Discover RSS/Atom feeds that might contain news articles
+    """
+    feed_urls = []
+    
+    for domain in domains:
+        if not domain.startswith('http'):
+            domain = f"https://{domain}"
+        
+        # Common RSS feed paths
+        feed_paths = [
+            '/rss', '/rss.xml', '/feed', '/feed.xml', '/feeds/all.atom.xml',
+            '/news/rss', '/news/feed', '/press/rss', '/media/feed'
+        ]
+        
+        try:
+            # Also check HTML pages for feed links
+            response = requests.get(domain, timeout=10)
+            soup = BeautifulSoup(response.text, 'html.parser')
+            
+            # Look for feed links in HTML head
+            for link in soup.find_all('link', {'type': ['application/rss+xml', 'application/atom+xml']}):
+                href = link.get('href')
+                if href:
+                    feed_urls.append(urljoin(domain, href))
+            
+            # Try common feed paths
+            for path in feed_paths:
+                feed_url = urljoin(domain, path)
+                try:
+                    feed_response = requests.head(feed_url, timeout=5)
+                    if feed_response.status_code == 200:
+                        feed_urls.append(feed_url)
+                except:
+                    pass
+                    
+        except Exception as e:
+            print(f"Error discovering feeds for {domain}: {e}")
+    
+    return list(set(feed_urls))
+
+
+@task(name="parse_rss_feeds")
+def parse_rss_feeds(feed_urls: List[str]) -> List[str]:
+    """
+    Parse RSS feeds to extract article URLs
+    """
+    try:
+        import feedparser
+    except ImportError:
+        print("feedparser not installed. Install with: pip install feedparser")
+        return []
+    
+    article_urls = []
+    
+    for feed_url in feed_urls:
+        try:
+            feed = feedparser.parse(feed_url)
+            
+            for entry in feed.entries:
+                if hasattr(entry, 'link') and entry.link:
+                    article_urls.append(entry.link)
+                    
+        except Exception as e:
+            print(f"Error parsing feed {feed_url}: {e}")
+    
+    return list(set(article_urls))
+
+
+@task(name="smart_url_discovery")
+def smart_url_discovery(config: Dict[str, Any]) -> List[str]:
+    """
+    Intelligently discover URLs using multiple strategies
+    """
+    all_urls = []
+    
+    # Strategy 1: Use configured sources
+    for category, sources in config.get("sources", {}).items():
+        for source_name, source_config in sources.items():
+            if isinstance(source_config, dict):
+                all_urls.extend(source_config.get("index_pages", []))
+    
+    # Strategy 2: Auto-discover similar sites if enabled
+    if config.get("discovery", {}).get("auto_discover_similar_sites", False):
+        keywords = config.get("filtering", {}).get("required_keywords", ["health", "medical"])
+        seed_urls = all_urls[:3]  # Use first few as seeds
+        related_sites = discover_related_sites(seed_urls, keywords)
+        all_urls.extend(related_sites)
+    
+    # Strategy 3: Use sitemaps
+    domains = []
+    for url in all_urls:
+        domain = urlparse(url).netloc
+        if domain not in domains:
+            domains.append(domain)
+    
+    sitemap_urls = discover_sitemap_urls(domains)
+    all_urls.extend(sitemap_urls)
+    
+    # Strategy 4: Use RSS feeds
+    rss_feeds = discover_rss_feeds(domains)
+    rss_articles = parse_rss_feeds(rss_feeds)
+    all_urls.extend(rss_articles)
+    
+    return list(set(all_urls))  # Deduplicate
+
+
+@task(name="discover_new_documents_dynamic")
+def discover_new_documents_dynamic(config: Dict[str, Any]) -> List[str]:
+    """Enhanced document discovery using configuration"""
     article_links = []
     
-    for index_url in index_urls:
+    # Get URLs from smart discovery
+    urls_to_crawl = smart_url_discovery(config)
+    
+    for url in urls_to_crawl:
         try:
-            res = requests.get(index_url, timeout=10)
-            res.raise_for_status()
-            soup = BeautifulSoup(res.text, "html.parser")
+            response = requests.get(url, timeout=10, 
+                                  headers={'User-Agent': config.get('discovery', {}).get('user_agent', 'Mozilla/5.0')})
+            response.raise_for_status()
+            soup = BeautifulSoup(response.text, "html.parser")
+
+            # Extract domain for pattern matching
+            domain = urlparse(url).netloc
 
             for a in soup.find_all("a", href=True):
                 href = a["href"]
 
                 # Normalize to absolute URL
                 if not href.startswith("http"):
-                    from urllib.parse import urljoin
-                    href = urljoin(index_url, href)
+                    href = urljoin(url, href)
 
-                # ---- Filtering rules ---- #
-                if "cdc.gov" in href and re.search(r"/media/releases/", href):
-                    article_links.append(href)
-                elif "nih.gov" in href and re.search(r"/news-events/news-releases/", href):
-                    article_links.append(href)
-                elif "who.int" in href and re.search(r"/news/item/", href):
+                # Apply domain-specific patterns
+                if should_include_url(href, config, domain):
                     article_links.append(href)
 
         except Exception as e:
-            print(f"Error scraping {index_url}: {e}")
+            print(f"Error scraping {url}: {e}")
     
-    return list(set(article_links))  # deduplicate
+    return list(set(article_links))
 
 
-@task(name="check_existing_documents")
-def check_existing_documents(urls: list[str]) -> tuple[list[str], list[str]]:
+def should_include_url(url: str, config: Dict[str, Any], domain: str) -> bool:
     """
-    Check which URLs already exist in the vector store.
-    Returns: (new_urls, existing_urls)
+    Determine if a URL should be included based on configuration
     """
-    try:
-        # Initialize vector store to check existing documents
-        embeddings = GoogleGenerativeAIEmbeddings(model="models/gemini-embedding-001")
-        vector_store = Chroma(
-            collection_name="example_collection",
-            embedding_function=embeddings,
-            persist_directory=persist_directory
-        )
-        
-        # Get all existing document sources
-        collection = vector_store._collection
-        existing_docs = collection.get()
-        existing_sources = set()
-        
-        if existing_docs and existing_docs.get('metadatas'):
-            for metadata in existing_docs['metadatas']:
-                if metadata and 'source' in metadata:
-                    existing_sources.add(metadata['source'])
-        
-        new_urls = []
-        existing_urls = []
-        
-        for url in urls:
-            if url in existing_sources:
-                existing_urls.append(url)
-            else:
-                new_urls.append(url)
-        
-        print(f"Found {len(existing_urls)} existing URLs, {len(new_urls)} new URLs")
-        return new_urls, existing_urls
-        
-    except Exception as e:
-        print(f"Error checking existing documents: {e}")
-        # If we can't check, process all URLs to be safe
-        return urls, []
-
-
-@task(name="validate_document_urls")
-def validate_document_urls(urls: list[str]) -> list[str]:
-    """
-    Validate the URLs of documents to ensure they are accessible and relevant.
-    - Removes URLs that return non-200 responses
-    - Skips URLs with invalid content types (e.g., images)
-    """
-    validated_urls = []
-    for url in urls:
-        try:
-            r = httpx.get(url, timeout=10)
-            if r.status_code == 200 and "text/html" in r.headers.get("content-type", ""):
-                validated_urls.append(url)
-            else:
-                print(f"Skipping {url} -> status {r.status_code}, content {r.headers.get('content-type')}")
-        except Exception as e:
-            print(f"Error validating {url}: {e}")
-    return validated_urls
-
-
-@task(name="process_documents")
-def process_documents(urls: list[str]) -> list[Document]:
-    """
-    Fetch the HTML content from URLs, extract readable text, 
-    and convert into LangChain Document objects.
-    """
-    documents = []
-
-    for url in urls:
-        try:
-            r = httpx.get(url, timeout=15)
-            if r.status_code != 200:
-                print(f"Skipping {url} -> {r.status_code}")
-                continue
-
-            soup = BeautifulSoup(r.text, "html.parser")
-
-            # Remove script and style elements
-            for script in soup(["script", "style"]):
-                script.decompose()
-
-            # Basic text extraction (you can refine per-site)
-            text = soup.get_text(separator=" ", strip=True)
-
-            if len(text) < 500:  # skip junk pages
-                print(f"Skipping {url} -> too little text ({len(text)} chars)")
-                continue
-
-            # Clean up the text
-            text = re.sub(r'\s+', ' ', text).strip()
-
-            # Wrap into LangChain Document
-            doc = Document(
-                page_content=text,
-                metadata={"source": url, "length": len(text)}
-            )
-            documents.append(doc)
-            print(f"Processed {url} -> {len(text)} characters")
-
-        except Exception as e:
-            print(f"Error processing {url}: {e}")
-
-    print(f"Total documents processed: {len(documents)}")
-    return documents
-
-
-@task(name="add_documents_to_vector_store")
-def add_documents(documents: list[Document]):
-    """Write processed documents into vector store"""
-    if not documents:
-        print("No documents to add to vector store")
-        return
+    # Check exclude patterns
+    exclude_patterns = config.get("filtering", {}).get("exclude_patterns", [])
+    for pattern in exclude_patterns:
+        if re.search(pattern, url, re.IGNORECASE):
+            return False
     
-    print(f"Adding {len(documents)} documents to vector store")
-    add_documents_to_vector_store(documents=documents)
+    # Check domain-specific patterns
+    for category, sources in config.get("sources", {}).items():
+        for source_name, source_config in sources.items():
+            if isinstance(source_config, dict):
+                source_domain = source_config.get("domain", "")
+                if source_domain == "*" or source_domain in domain:
+                    patterns = source_config.get("link_patterns", [])
+                    if any(re.search(pattern, url) for pattern in patterns):
+                        return True
+    
+    # Default: include if it contains news-like keywords
+    news_keywords = ['news', 'press', 'release', 'media', 'announcement']
+    return any(keyword in url.lower() for keyword in news_keywords)
 
 
-# -------- Prefect Flow -------- #
+# -------- Main Flow -------- #
 
-@flow(name="index")
-def index_documents():
-    # Call tasks
-    article_links = discover_new_documents(source_urls["index_pages"])
-    direct_articles = source_urls["direct_articles"]
-
-    # Prefect will pass task result as a value here
-    all_urls = article_links + direct_articles  
-    print(f"Found {len(all_urls)} total URLs")
-
-    if not all_urls:
-        print("No URLs found to process")
+@flow(name="dynamic_index")
+def index_documents_dynamic(config_source: str = "yaml"):
+    """
+    Main indexing flow with dynamic URL discovery
+    """
+    # Load configuration
+    if config_source == "yaml":
+        config = load_source_config("sources.yaml")
+    elif config_source == "env":
+        config = load_source_config_from_env()
+    else:
+        raise ValueError("config_source must be 'yaml' or 'env'")
+    
+    print(f"Loaded configuration: {len(config.get('sources', {}))} source categories")
+    
+    # Discover URLs dynamically
+    article_links = discover_new_documents_dynamic(config)
+    print(f"Discovered {len(article_links)} URLs")
+    
+    if not article_links:
+        print("No URLs discovered")
         return
 
-    # Check for existing documents first
-    new_urls, existing_urls = check_existing_documents(all_urls)
+    # Check for existing documents
+    from fixed_indexing import check_existing_documents, validate_document_urls, process_documents, add_documents
+    
+    new_urls, existing_urls = check_existing_documents(article_links)
     
     if existing_urls:
         print(f"Skipping {len(existing_urls)} existing documents")
@@ -231,5 +399,6 @@ def index_documents():
 
 
 if __name__ == "__main__":
-    index_documents()
-    print("Indexing completed.")
+    # You can switch between configuration sources
+    index_documents_dynamic(config_source="yaml")  # or "env"
+    print("Dynamic indexing completed.")
