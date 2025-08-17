@@ -68,6 +68,49 @@ def discover_new_documents(index_urls: list[str]) -> list[str]:
     return list(set(article_links))  # deduplicate
 
 
+@task(name="check_existing_documents")
+def check_existing_documents(urls: list[str]) -> tuple[list[str], list[str]]:
+    """
+    Check which URLs already exist in the vector store.
+    Returns: (new_urls, existing_urls)
+    """
+    try:
+        # Initialize vector store to check existing documents
+        embeddings = GoogleGenerativeAIEmbeddings(model="models/gemini-embedding-001")
+        vector_store = Chroma(
+            collection_name="example_collection",
+            embedding_function=embeddings,
+            persist_directory=persist_directory
+        )
+        
+        # Get all existing document sources
+        collection = vector_store._collection
+        existing_docs = collection.get()
+        existing_sources = set()
+        
+        if existing_docs and existing_docs.get('metadatas'):
+            for metadata in existing_docs['metadatas']:
+                if metadata and 'source' in metadata:
+                    existing_sources.add(metadata['source'])
+        
+        new_urls = []
+        existing_urls = []
+        
+        for url in urls:
+            if url in existing_sources:
+                existing_urls.append(url)
+            else:
+                new_urls.append(url)
+        
+        print(f"Found {len(existing_urls)} existing URLs, {len(new_urls)} new URLs")
+        return new_urls, existing_urls
+        
+    except Exception as e:
+        print(f"Error checking existing documents: {e}")
+        # If we can't check, process all URLs to be safe
+        return urls, []
+
+
 @task(name="validate_document_urls")
 def validate_document_urls(urls: list[str]) -> list[str]:
     """
@@ -149,14 +192,6 @@ def add_documents(documents: list[Document]):
 
 @flow(name="index")
 def index_documents():
-    # Setup embeddings + vector store
-    embeddings = GoogleGenerativeAIEmbeddings(model="models/gemini-embedding-001")
-    vector_store = Chroma(
-        collection_name="example_collection",
-        embedding_function=embeddings,
-        persist_directory=persist_directory
-    )
-
     # Call tasks
     article_links = discover_new_documents(source_urls["index_pages"])
     direct_articles = source_urls["direct_articles"]
@@ -169,20 +204,30 @@ def index_documents():
         print("No URLs found to process")
         return
 
-    validated_urls = validate_document_urls(all_urls)
-    print(f"Validated {len(validated_urls)} URLs")
+    # Check for existing documents first
+    new_urls, existing_urls = check_existing_documents(all_urls)
+    
+    if existing_urls:
+        print(f"Skipping {len(existing_urls)} existing documents")
+    
+    if not new_urls:
+        print("No new URLs to process")
+        return
+
+    validated_urls = validate_document_urls(new_urls)
+    print(f"Validated {len(validated_urls)} new URLs")
     
     if not validated_urls:
-        print("No valid URLs to process")
+        print("No valid new URLs to process")
         return
 
     documents = process_documents(validated_urls)
     
     if documents:
         add_documents(documents)
-        print(f"Successfully added {len(documents)} documents to vector store")
+        print(f"Successfully added {len(documents)} new documents to vector store")
     else:
-        print("No documents were processed successfully")
+        print("No new documents were processed successfully")
 
 
 if __name__ == "__main__":
