@@ -1,0 +1,4 @@
+myvenv/
+chroma_langchain_db/
+.env
+# Ignore Python cache files
